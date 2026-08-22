@@ -1,0 +1,10 @@
+# build artifacts
+/p2p
+/mini-P2P
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
