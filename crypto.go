@@ -3,10 +3,21 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/rand"
+	"crypto/sha256"
+	"log"
 )
 
-//var sharedKey, _ = hex.DecodeString("808ae593438bca380f55a2314fe39c19808ae593438bca380f55a2314fe39c19")
+func deriveKey(rawSecret []byte) []byte {
+	var protocolSalt = []byte("mini-p2p-v1")
+	aesKey, err := hkdf.Key(sha256.New, rawSecret, protocolSalt, "Mingda is damowang", 32)
+	if err != nil {
+		log.Printf("hkdf derive key error: %v", err)
+		return nil
+	}
+	return aesKey
+}
 
 func encrypt(shared, plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, 12)
