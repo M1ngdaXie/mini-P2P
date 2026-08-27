@@ -79,7 +79,7 @@ func (p *peerStore) List() map[string][]byte {
 }
 func main() {
 	port := flag.Int("port", 9001, "服务器监听的端口")
-	peer := flag.String("peer", "127.0.0.1:9002", "peer地址")
+	peer := flag.String("peer", "", "peer地址(可选,空则只靠广播发现)")
 	flag.Parse()
 	store := newPeerStore(10)
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port})
@@ -92,26 +92,32 @@ func main() {
 	privatekey, _ := ecdh.X25519().GenerateKey(rand.Reader)
 	publicKey := privatekey.PublicKey().Bytes()
 	go BroadcastAndListen(conn, publicKey, privatekey, store, *port)
-	peerAddr, err := net.ResolveUDPAddr("udp", *peer)
-	if err != nil {
-		fmt.Println("解析 peer 地址失败:", err)
-		return
-	}
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	go func() {
-		for range ticker.C {
-			_, ok := store.Get(peerAddr.String())
-			if !ok {
-				log.Printf("Dont have peer key %s tickering \n", peerAddr.String())
-				err := sendPublicKey(conn, peerAddr, publicKey)
-				if err != nil {
-					log.Printf("Error Ticker sending PublicKey: %s\n", err)
-					return
+	if *peer != "" {
+		peerAddr, err := net.ResolveUDPAddr("udp", *peer)
+		if err != nil {
+			fmt.Println("解析 peer 地址失败:", err)
+			return
+		}
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		go func() {
+			for range ticker.C {
+				// 跳过指向自己的直连目标
+				if peerAddr.Port == *port {
+					continue
+				}
+				_, ok := store.Get(peerAddr.String())
+				if !ok {
+					log.Printf("Dont have peer key %s tickering \n", peerAddr.String())
+					err := sendPublicKey(conn, peerAddr, publicKey)
+					if err != nil {
+						log.Printf("Error Ticker sending PublicKey: %s\n", err)
+						return
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 	go func() {
 		for {
 			message, err := bufio.NewReader(os.Stdin).ReadString('\n')
