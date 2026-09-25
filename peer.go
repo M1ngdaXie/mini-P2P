@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/binary"
@@ -15,6 +16,11 @@ import (
 	"time"
 )
 
+// 退出逻辑流程：
+// 想法1:
+// 发送退出包，让对方删除map相关信息，下一次正常握手
+// 想法2:
+// 每次都验证sessionid，如果id不同则重新握手，不删除，大概流程是在handlemessage里面发现不对的id
 var mySessionId []byte = GetSessionId()
 
 // 握手包的两种类型。载荷完全一样([sessionId 16][pubkey 32]),
@@ -51,6 +57,7 @@ type peerStore struct {
 	changeChan    chan ChangeReq
 	incrementChan chan IncrementReq
 	PatrolChan    chan PatrolReq
+	reconnectChan chan ReconnectReq
 }
 type changewhat string
 
@@ -66,6 +73,11 @@ type ChangeReq struct {
 	Address    string
 	SessionId  []byte
 	State      status
+}
+type ReconnectReq struct {
+	SessionId []byte
+	Secret    []byte
+	Address   string
 }
 type ListReq struct {
 	Reply chan map[string][]string
@@ -114,6 +126,7 @@ func newPeerStore(bufferSize int) *peerStore {
 		changeChan:    make(chan ChangeReq, bufferSize),
 		incrementChan: make(chan IncrementReq, bufferSize),
 		PatrolChan:    make(chan PatrolReq, bufferSize),
+		reconnectChan: make(chan ReconnectReq, bufferSize),
 	}
 	go store.run()
 	return store
@@ -149,6 +162,7 @@ func (p *peerStore) run() {
 				} else {
 					snapshot[k] = append(snapshot[k], "Handshaking")
 				}
+				log.Printf("peer %s: SessionId=%x", k, v.SessionId)
 			}
 			list.Reply <- snapshot
 		case change := <-p.changeChan:
@@ -194,6 +208,21 @@ func (p *peerStore) run() {
 				snapshot = append(snapshot, peer.Address)
 			}
 			patrol.relayChan <- snapshot
+
+		case reconnect := <-p.reconnectChan:
+			peer, ok := peerList[reconnect.Address]
+			if !ok {
+				continue
+			}
+			peer.SessionId = reconnect.SessionId
+			peer.Secret = reconnect.Secret
+			peer.SendSeq = 0
+			peer.PatrolCount = 0
+			peer.PeerHasMyKey = false
+			peer.SentConfirm = false
+			peer.State = statusPending
+			peer.LastSeen = time.Now()
+			peerList[reconnect.Address] = peer
 		}
 	}
 }
@@ -229,6 +258,7 @@ func (p *peerStore) ChangeState(address string) {
 		State:      statusSuccess,
 	}
 }
+
 // SetPeerHasMyKey 记下"对方已经拿到我的公钥"(收到它的 0x03 时调用)。
 func (p *peerStore) SetPeerHasMyKey(address string) {
 	p.changeChan <- ChangeReq{Changewhat: changePeerHasMyKey, Address: address}
@@ -244,6 +274,11 @@ func (p *peerStore) PatrolPeers() []string {
 	p.PatrolChan <- PatrolReq{relayChan: replyChan}
 	return <-replyChan
 }
+
+func (p *peerStore) ReconnectPeer(address string, sid []byte, secretKey []byte) {
+	p.reconnectChan <- ReconnectReq{Address: address, SessionId: sid, Secret: secretKey}
+}
+
 func main() {
 	port := flag.Int("port", 9001, "服务器监听的端口")
 	peer := flag.String("peer", "", "peer地址(可选,空则只靠广播发现)")
@@ -276,7 +311,6 @@ func main() {
 					continue
 				}
 				_, ok := store.Get(peerAddr.String())
-				log.Printf("Sending keys to peer %s every 5 second \n", peerAddr.String())
 				if !ok {
 					log.Printf("Dont have peer key %s tickering \n", peerAddr.String())
 					err := sendPublicKey(conn, peerAddr, publicKey, typeHandshake)
@@ -422,7 +456,7 @@ func Write(conn *net.UDPConn, addr *net.UDPAddr, msg []byte, loss float64) error
 func handleMessage(conn *net.UDPConn, store *peerStore, addr string, buf []byte, n int) error {
 	peer, ok := store.Get(addr)
 	if !ok {
-		log.Printf("No secret received from %s\n yet", addr)
+		log.Printf("No secret received from %s yet", addr)
 		return nil
 	}
 	seq := buf[1:9]
@@ -470,9 +504,14 @@ func isLocalIP(ip net.IP) bool {
 	return false
 }
 
-func handleHandShake(peerAddr *net.UDPAddr, conn *net.UDPConn, store *peerStore,
+func handleHandShake(
+	peerAddr *net.UDPAddr,
+	conn *net.UDPConn,
+	store *peerStore,
 	publicKey []byte,
-	privateKey *ecdh.PrivateKey, buf []byte, n int) error {
+	privateKey *ecdh.PrivateKey,
+	buf []byte,
+	n int) error {
 	if n != handshakeLen {
 		log.Printf("Bad handshake length from %s: got %d, want %d\n",
 			peerAddr.String(), n, handshakeLen)
@@ -482,21 +521,24 @@ func handleHandShake(peerAddr *net.UDPAddr, conn *net.UDPConn, store *peerStore,
 
 	// 类型字节携带的那 1 比特:对方说它已经有我的公钥了。
 	confirmed := buf[0] == typeHandshakeConfirm
-
-	_, ok := store.Get(peerAddr.String())
+	sid := buf[1:17]
+	peer, ok := store.Get(peerAddr.String())
+	if ok && !bytes.Equal(sid, peer.SessionId) {
+		log.Printf("Session ID mismatch for %s: got %x, want %x\n",
+			peerAddr.String(), sid, peer.SessionId)
+		handleReconnect(buf, peerAddr.String(), n, privateKey, store)
+		return nil
+	}
 	if ok {
 		// 已经有它的密钥了,不必重新派生(重新派生会连带重置 State 和 SendSeq)。
 		// 但那 1 比特仍要收下 —— 它正是巡逻停止的依据。
 		if confirmed {
+			log.Printf("Peer %s already has our pk, marking", peerAddr.String())
 			store.SetPeerHasMyKey(peerAddr.String())
 		}
 		return nil
 	}
 
-	sid := buf[1:17]
-	//if !bytes.Equal(sid, peer.SessionId){
-	//	// #TODO handles close connection mechanism
-	//}
 	peerpk, err := ecdh.X25519().NewPublicKey(buf[17:n])
 	if err != nil {
 		log.Printf("Error generating public key: %s\n", err)
@@ -513,6 +555,24 @@ func handleHandShake(peerAddr *net.UDPAddr, conn *net.UDPConn, store *peerStore,
 	store.Set(hkdfKey, peerAddr.String(), time.Now(), sid, confirmed)
 	return nil
 }
+func handleReconnect(buf []byte, peeraddress string, n int, privateKey *ecdh.PrivateKey, store *peerStore) {
+	log.Printf("reconnect: %s\n", peeraddress)
+	sid := buf[1:17]
+	peerpk, err := ecdh.X25519().NewPublicKey(buf[17:n])
+	if err != nil {
+		log.Printf("Error generating public key: %s\n", err)
+		return
+	}
+	sharedSecret, err := privateKey.ECDH(peerpk)
+	if err != nil {
+		log.Printf("Error generating shared secret: %s\n", err)
+		return
+	}
+	log.Printf("generated Secret: %x\n", sharedSecret)
+	hkdfKey := deriveKey(sharedSecret)
+	store.ReconnectPeer(peeraddress, sid, hkdfKey)
+}
+
 // sendPublicKey 发一个握手包。msgType 决定它是 0x00(我还没有你的公钥)
 // 还是 0x03(我已经有你的了) —— 载荷两者完全相同。
 func sendPublicKey(conn *net.UDPConn, peerAddr *net.UDPAddr, publicKey []byte,
